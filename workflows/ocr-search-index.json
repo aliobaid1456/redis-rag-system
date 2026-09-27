@@ -1,0 +1,847 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## v1/ocr-search/index\n\nReads already-extracted OCR text directly from SQL Server\n(Docs_Record -> Docs_DocumentInfo -> Docs_AttachmentsInfo -> OcrResultInfo,\nOcrResultInfo.AttachmentId = Docs_AttachmentsInfo.MongoDbId) and\nindexes it into Qdrant, one page = one chunk. No file upload, no\ncontent-extraction-service -- the text already exists in the DB.\n\nVERIFY the real dbo table names in the SQL node before running --\nthey're assumed from the CSV export names.\n\nOptional body field: document_id (UUID) -- re-index just one\ndocument instead of the full table. Omit for a full sync.\n\nPurely additive: re-running does NOT delete old points for the\nsame document first. Ask if you want delete-before-insert added.\n\nprepare chunk metadata now also strips embedded HTML (e.g. pasted\n<table> markup) out of chunk_content before it's embedded/indexed --\ntables are flattened to readable \"label | value\" lines.",
+        "height": 320,
+        "width": 400,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1216,
+        -704
+      ],
+      "id": "0bdb7014-64cf-4b78-b7a6-eec45aba7ccf",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "v1/ocr-search/index",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1168,
+        -352
+      ],
+      "id": "9c6ff63a-54be-40b6-a737-b71eee3c8642",
+      "name": "do index",
+      "webhookId": "05024233-8a4b-46ba-bf8f-888240b1dcac"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f8ed7d9e-0049-4d90-9955-93507dcd273c",
+              "name": "EMBEDDING_MODEL",
+              "value": "jinaai/jina-embeddings-v3",
+              "type": "string"
+            },
+            {
+              "id": "01496ea0-83d1-4693-976b-0dc2fd2b8c3e",
+              "name": "COLLECTION_NAME",
+              "value": "ocr_documents_search",
+              "type": "string"
+            },
+            {
+              "id": "b58bcec3-5bba-443e-ade5-5fcb359d033c",
+              "name": "QDRANT_BASE_URL",
+              "value": "http://qdrant:6333",
+              "type": "string"
+            },
+            {
+              "id": "9d169e43-39d2-4de9-a44c-d52045679b1e",
+              "name": "QDRANT_API_KEY",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "f8a5ae27-837d-4d31-a421-63247b0f15b3",
+              "name": "METADATA_TEXT_FIELDS",
+              "value": "[\"metadata.document_name_ar\", \"metadata.document_name_en\", \"metadata.document_no\", \"metadata.reference_no\", \"metadata.content_keywords\", \"metadata.record_name_ar\", \"metadata.record_name_en\", \"metadata.document_subject_name_ar\", \"metadata.document_subject_name_en\", \"metadata.record_subject_name_ar\", \"metadata.record_subject_name_en\"]",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {
+          "dotNotation": true
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -912,
+        -352
+      ],
+      "id": "26baa3df-e2a2-4699-a078-6eb2ee082fcd",
+      "name": "index configs"
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import uuid\nimport json\n\ntry:\n    item = _items[0]\n    raw = item.get('json', {}) or {}\n\n    body = raw.get('body', {}) or {}\n    if isinstance(body, str):\n        body = body.strip()\n        try:\n            body = json.loads(body) if body else {}\n        except json.JSONDecodeError:\n            body = {}\n    if not isinstance(body, dict):\n        body = {}\n\n    document_id_filter = str(body.get('document_id') or '').strip().lower()\n    if document_id_filter:\n        try:\n            uuid.UUID(document_id_filter)\n        except ValueError:\n            raise ValueError(\"Invalid format for 'document_id'. Must be a valid UUID.\")\n    else:\n        document_id_filter = None\n\n    return [{\n        \"json\": {\n            \"document_id_filter\": document_id_filter,\n            \"collection_name\": raw.get('COLLECTION_NAME', 'ocr_documents_search')\n        },\n        \"pairedItem\": 0\n    }]\n\nexcept ValueError as e:\n    print(f\"Validation Error: {e}\")\n    raise\n\nexcept IndexError:\n    print(\"Error: The input to the Code node is empty.\")\n    raise ValueError(\"No input data received.\")\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        -352
+      ],
+      "id": "feb63570-c30c-48f4-b902-527701e69afb",
+      "name": "validate request",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n    ocr.Id AS ocr_id,\n    COALESCE(NULLIF(ocr.MarkDownResultText, '') COLLATE DATABASE_DEFAULT, ocr.Result COLLATE DATABASE_DEFAULT) AS page_text,\n    ocr.PageNo AS page_no,\n    att.Id AS attachment_id,\n    att.AttachmentName AS attachment_name,\n    att.TotalPages AS total_pages,\n\n    doc.Id AS document_id,\n    doc.NameAr AS document_name_ar,\n    doc.NameEn AS document_name_en,\n    doc.DocumentNo AS document_no,\n    doc.DocumentDate AS document_date,\n    doc.ContentKeyWords AS content_keywords,\n    doc.SecurityLevelId AS document_security_level_id,\n    doc.ImportanceLevelId AS document_importance_level_id,\n    doc.MainDocTypeId AS document_main_doc_type_id,\n    doc.SecondaryDocTypeId AS document_secondary_doc_type_id,\n    doc.StatusLookupId AS document_status_id,\n    doc.TextTypeId AS document_text_type_id,\n    doc.AssetTypeId AS document_asset_type_id,\n    doc.MaterialTypeId AS document_material_type_id,\n    doc.SubjectId AS document_subject_id,\n\n    docsec.Name_Ar AS document_security_level_name_ar,\n    docsec.Name_Eng AS document_security_level_name_en,\n    docimp.NameAr AS document_importance_level_name_ar,\n    docmaintype.NameAr AS document_main_doc_type_name_ar,\n    docmaintype.NameEn AS document_main_doc_type_name_en,\n    docsubtype.Name AS document_secondary_doc_type_name,\n    docstatus.Name_Ar AS document_status_name_ar,\n    docstatus.Name_En AS document_status_name_en,\n    doctexttype.NameAr AS document_text_type_name_ar,\n    doctexttype.NameEn AS document_text_type_name_en,\n    docassettype.NameAr AS document_asset_type_name_ar,\n    docassettype.NameEn AS document_asset_type_name_en,\n    docmaterial.Name_Ar AS document_material_type_name_ar,\n    docmaterial.Name_Eng AS document_material_type_name_en,\n    docsubject.Subject_Name_Ar AS document_subject_name_ar,\n    docsubject.Subject_Name_En AS document_subject_name_en,\n\n    rec.Id AS record_id,\n    rec.NameAr AS record_name_ar,\n    rec.NameEng AS record_name_en,\n    rec.ReferenceNo AS reference_no,\n    rec.TreatmentDate AS treatment_date,\n    rec.SecurityLevelId AS record_security_level_id,\n    rec.ImportantLevelId AS record_important_level_id,\n    rec.DepartmentId AS record_department_id,\n    rec.SubjectId AS record_subject_id,\n\n    recsec.Name_Ar AS record_security_level_name_ar,\n    recsec.Name_Eng AS record_security_level_name_en,\n    recimp.NameAr AS record_important_level_name_ar,\n    recdept.Dept_Name_Ar AS record_department_name_ar,\n    recdept.Dept_Name_En AS record_department_name_en,\n    recsubject.Subject_Name_Ar AS record_subject_name_ar,\n    recsubject.Subject_Name_En AS record_subject_name_en\n\n-- Relationship: Record -> DocumentInfo -> AttachmentsInfo -> OcrResultInfo\n-- (OcrResultInfo.AttachmentId points at AttachmentsInfo.MongoDbId, not AttachmentsInfo.Id)\nFROM dbo.Docs_Record rec\nLEFT JOIN dbo.Docs_DocumentInfo doc ON rec.Id = doc.Docs_RecordId AND doc.IsDeleted = 0\nLEFT JOIN dbo.Docs_AttachmentsInfo att ON doc.Id = att.DocumentId AND att.IsDeleted = 0\nLEFT JOIN dbo.OcrResultInfo ocr ON ocr.AttachmentId = att.MongoDbId AND ocr.IsDeleted = 0\n\nLEFT JOIN dbo.Docs_SecurityLevelLookup docsec ON docsec.Id = doc.SecurityLevelId\nLEFT JOIN dbo.Docs_ImportanceLevelLookup docimp ON docimp.Id = doc.ImportanceLevelId\nLEFT JOIN dbo.DMS_DocumentMainTypes docmaintype ON docmaintype.Id = doc.MainDocTypeId\nLEFT JOIN dbo.DMS_DocumentSubTypes docsubtype ON docsubtype.Id = doc.SecondaryDocTypeId\nLEFT JOIN dbo.Docs_DocumentStatusLookup docstatus ON docstatus.Id = doc.StatusLookupId\nLEFT JOIN dbo.Docs_DocumentTextType doctexttype ON doctexttype.Id = doc.TextTypeId\nLEFT JOIN dbo.Docs_DocumentAssetType docassettype ON docassettype.Id = doc.AssetTypeId\nLEFT JOIN dbo.Docs_MaterialTypeLookup docmaterial ON docmaterial.Id = doc.MaterialTypeId\nLEFT JOIN dbo.Docs_Subject docsubject ON docsubject.Id = doc.SubjectId\n\nLEFT JOIN dbo.Docs_SecurityLevelLookup recsec ON recsec.Id = rec.SecurityLevelId\nLEFT JOIN dbo.Docs_ImportanceLevelLookup recimp ON recimp.Id = rec.ImportantLevelId\nLEFT JOIN dbo.Docs_Department recdept ON recdept.Id = rec.DepartmentId\nLEFT JOIN dbo.Docs_Subject recsubject ON recsubject.Id = rec.SubjectId\n\nWHERE rec.IsDeleted = 0\n  -- only pages that actually have OCR text can be embedded; records/documents/attachments\n  -- without an OCR row come through the LEFT JOINs as NULLs and are skipped here\n  AND ocr.Id IS NOT NULL\n  AND NULLIF(LTRIM(RTRIM(COALESCE(NULLIF(ocr.MarkDownResultText, '') COLLATE DATABASE_DEFAULT, ocr.Result COLLATE DATABASE_DEFAULT))), '') IS NOT NULL\n  AND ($1 IS NULL OR doc.Id = CAST($1 AS uniqueidentifier))\nORDER BY rec.Id, doc.Id, att.Id, ocr.PageNo",
+        "options": {
+          "queryReplacement": "={{ [$json.document_id_filter] }}"
+        }
+      },
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        -384,
+        -352
+      ],
+      "id": "15bc2444-05ab-4843-94f7-3836c1fe6b06",
+      "name": "run OCR documents query",
+      "credentials": {
+        "microsoftSql": {
+          "id": "ukLgv3pCMa8ld9PJ",
+          "name": "SQL Server Eplatform DB Noursoft"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import re\nimport html\n\n\ndef html_to_text(s):\n    \"\"\"Strip HTML markup that sometimes shows up inside OCR page text (e.g. Word/HTML\n    tables pasted into the source document), converting it into plain readable text\n    instead of leaving raw tags in what gets embedded and indexed.\n\n    Tables are flattened one row per line, cells joined with \" | \", empty cells\n    dropped. Everything else is just tag-stripped. Non-HTML text (plain OCR /\n    Markdown) passes through basically unchanged.\n    \"\"\"\n    if not s:\n        return s\n\n    # newline before each table row; join cells within a row with \" | \"\n    s = re.sub(r'(?i)<\\s*tr[^>]*>', '\\n', s)\n    s = re.sub(r'(?i)<\\s*/\\s*tr\\s*>', '', s)\n    s = re.sub(r'(?i)<\\s*/\\s*t[dh]\\s*>', ' | ', s)\n    s = re.sub(r'(?i)<\\s*t[dh][^>]*>', '', s)\n    # table wrapper tags become line breaks\n    s = re.sub(r'(?i)<\\s*/?\\s*(table|tbody|thead|tfoot)[^>]*>', '\\n', s)\n    # <br> -> newline\n    s = re.sub(r'(?i)<\\s*br\\s*/?\\s*>', '\\n', s)\n    # <p>/<div> boundaries -> newline (in case any show up)\n    s = re.sub(r'(?i)<\\s*/?\\s*(p|div)[^>]*>', '\\n', s)\n    # drop any remaining tags entirely\n    s = re.sub(r'<[^>]+>', '', s)\n    # decode entities (&nbsp; etc.) and strip stray BOM/zero-width chars common in OCR HTML\n    s = html.unescape(s)\n    s = s.replace('\\ufeff', '')\n\n    lines = []\n    for raw_line in s.split('\\n'):\n        line = raw_line.strip()\n        line = re.sub(r'^[\\s|]+', '', line)      # leading empty cells / separators\n        line = re.sub(r'[\\s|]+$', '', line)      # trailing empty cells / separators\n        line = re.sub(r'\\|(\\s*\\|)+', '|', line)  # collapse repeated empty-cell separators\n        line = re.sub(r'[ \\t]{2,}', ' ', line)\n        if line:\n            lines.append(line)\n    return '\\n'.join(lines)\n\n\ntry:\n    output_items = []\n    for i, it in enumerate(_items):\n        r = it.get('json', {}) or {}\n        output_items.append({\n            \"json\": {\n                \"chunk_content\": html_to_text(r.get('page_text') or ''),\n                \"page_no\": r.get('page_no'),\n                \"attachment_id\": r.get('attachment_id'),\n                \"attachment_name\": r.get('attachment_name'),\n                \"total_pages\": r.get('total_pages'),\n                \"document_id\": r.get('document_id'),\n                \"document_name_ar\": r.get('document_name_ar'),\n                \"document_name_en\": r.get('document_name_en'),\n                \"document_no\": r.get('document_no'),\n                \"document_date\": r.get('document_date'),\n                \"content_keywords\": r.get('content_keywords'),\n                \"document_security_level_id\": r.get('document_security_level_id'),\n                \"document_security_level_name_ar\": r.get('document_security_level_name_ar'),\n                \"document_security_level_name_en\": r.get('document_security_level_name_en'),\n                \"document_importance_level_id\": r.get('document_importance_level_id'),\n                \"document_importance_level_name_ar\": r.get('document_importance_level_name_ar'),\n                \"document_main_doc_type_id\": r.get('document_main_doc_type_id'),\n                \"document_main_doc_type_name_ar\": r.get('document_main_doc_type_name_ar'),\n                \"document_main_doc_type_name_en\": r.get('document_main_doc_type_name_en'),\n                \"document_secondary_doc_type_id\": r.get('document_secondary_doc_type_id'),\n                \"document_secondary_doc_type_name\": r.get('document_secondary_doc_type_name'),\n                \"document_status_id\": r.get('document_status_id'),\n                \"document_status_name_ar\": r.get('document_status_name_ar'),\n                \"document_status_name_en\": r.get('document_status_name_en'),\n                \"document_text_type_id\": r.get('document_text_type_id'),\n                \"document_text_type_name_ar\": r.get('document_text_type_name_ar'),\n                \"document_text_type_name_en\": r.get('document_text_type_name_en'),\n                \"document_asset_type_id\": r.get('document_asset_type_id'),\n                \"document_asset_type_name_ar\": r.get('document_asset_type_name_ar'),\n                \"document_asset_type_name_en\": r.get('document_asset_type_name_en'),\n                \"document_material_type_id\": r.get('document_material_type_id'),\n                \"document_material_type_name_ar\": r.get('document_material_type_name_ar'),\n                \"document_material_type_name_en\": r.get('document_material_type_name_en'),\n                \"document_subject_id\": r.get('document_subject_id'),\n                \"document_subject_name_ar\": r.get('document_subject_name_ar'),\n                \"document_subject_name_en\": r.get('document_subject_name_en'),\n                \"record_id\": r.get('record_id'),\n                \"record_name_ar\": r.get('record_name_ar'),\n                \"record_name_en\": r.get('record_name_en'),\n                \"reference_no\": r.get('reference_no'),\n                \"treatment_date\": r.get('treatment_date'),\n                \"record_security_level_id\": r.get('record_security_level_id'),\n                \"record_security_level_name_ar\": r.get('record_security_level_name_ar'),\n                \"record_security_level_name_en\": r.get('record_security_level_name_en'),\n                \"record_important_level_id\": r.get('record_important_level_id'),\n                \"record_important_level_name_ar\": r.get('record_important_level_name_ar'),\n                \"record_department_id\": r.get('record_department_id'),\n                \"record_department_name_ar\": r.get('record_department_name_ar'),\n                \"record_department_name_en\": r.get('record_department_name_en'),\n                \"record_subject_id\": r.get('record_subject_id'),\n                \"record_subject_name_ar\": r.get('record_subject_name_ar'),\n                \"record_subject_name_en\": r.get('record_subject_name_en')\n            },\n            \"pairedItem\": i\n        })\n    return output_items\n\nexcept Exception as e:\n    print(f\"Chunk preparation error: {e}\")\n    raise\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -128,
+        -352
+      ],
+      "id": "7b8cfca5-1c24-4ace-8836-370f29da5aa0",
+      "name": "prepare chunk metadata",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "model": "={{$('index configs').item.json.EMBEDDING_MODEL}}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        128,
+        -176
+      ],
+      "id": "c85b8f9a-54d5-49f9-ac6f-6abab90d7cc5",
+      "name": "Embeddings (index)",
+      "credentials": {
+        "openAiApi": {
+          "id": "glEm1QPfW4IFY4DB",
+          "name": "OpenAi Local vLLM"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chunkSize": 100000
+      },
+      "type": "@n8n/n8n-nodes-langchain.textSplitterCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [
+        128,
+        -32
+      ],
+      "id": "e4752a35-66c3-4af0-b64d-1a85d8bc889f",
+      "name": "Character Text Splitter"
+    },
+    {
+      "parameters": {
+        "jsonMode": "expressionData",
+        "jsonData": "={{ $json.chunk_content }}",
+        "textSplittingMode": "custom",
+        "options": {
+          "metadata": {
+            "metadataValues": [
+              {
+                "name": "page_no",
+                "value": "={{ $json.page_no }}"
+              },
+              {
+                "name": "attachment_id",
+                "value": "={{ $json.attachment_id }}"
+              },
+              {
+                "name": "attachment_name",
+                "value": "={{ $json.attachment_name }}"
+              },
+              {
+                "name": "total_pages",
+                "value": "={{ $json.total_pages }}"
+              },
+              {
+                "name": "document_id",
+                "value": "={{ $json.document_id }}"
+              },
+              {
+                "name": "document_name_ar",
+                "value": "={{ $json.document_name_ar }}"
+              },
+              {
+                "name": "document_name_en",
+                "value": "={{ $json.document_name_en }}"
+              },
+              {
+                "name": "document_no",
+                "value": "={{ $json.document_no }}"
+              },
+              {
+                "name": "document_date",
+                "value": "={{ $json.document_date }}"
+              },
+              {
+                "name": "content_keywords",
+                "value": "={{ $json.content_keywords }}"
+              },
+              {
+                "name": "document_security_level_id",
+                "value": "={{ $json.document_security_level_id }}"
+              },
+              {
+                "name": "document_security_level_name_ar",
+                "value": "={{ $json.document_security_level_name_ar }}"
+              },
+              {
+                "name": "document_security_level_name_en",
+                "value": "={{ $json.document_security_level_name_en }}"
+              },
+              {
+                "name": "document_importance_level_id",
+                "value": "={{ $json.document_importance_level_id }}"
+              },
+              {
+                "name": "document_importance_level_name_ar",
+                "value": "={{ $json.document_importance_level_name_ar }}"
+              },
+              {
+                "name": "document_main_doc_type_id",
+                "value": "={{ $json.document_main_doc_type_id }}"
+              },
+              {
+                "name": "document_main_doc_type_name_ar",
+                "value": "={{ $json.document_main_doc_type_name_ar }}"
+              },
+              {
+                "name": "document_main_doc_type_name_en",
+                "value": "={{ $json.document_main_doc_type_name_en }}"
+              },
+              {
+                "name": "document_secondary_doc_type_id",
+                "value": "={{ $json.document_secondary_doc_type_id }}"
+              },
+              {
+                "name": "document_secondary_doc_type_name",
+                "value": "={{ $json.document_secondary_doc_type_name }}"
+              },
+              {
+                "name": "document_status_id",
+                "value": "={{ $json.document_status_id }}"
+              },
+              {
+                "name": "document_status_name_ar",
+                "value": "={{ $json.document_status_name_ar }}"
+              },
+              {
+                "name": "document_status_name_en",
+                "value": "={{ $json.document_status_name_en }}"
+              },
+              {
+                "name": "document_text_type_id",
+                "value": "={{ $json.document_text_type_id }}"
+              },
+              {
+                "name": "document_text_type_name_ar",
+                "value": "={{ $json.document_text_type_name_ar }}"
+              },
+              {
+                "name": "document_text_type_name_en",
+                "value": "={{ $json.document_text_type_name_en }}"
+              },
+              {
+                "name": "document_asset_type_id",
+                "value": "={{ $json.document_asset_type_id }}"
+              },
+              {
+                "name": "document_asset_type_name_ar",
+                "value": "={{ $json.document_asset_type_name_ar }}"
+              },
+              {
+                "name": "document_asset_type_name_en",
+                "value": "={{ $json.document_asset_type_name_en }}"
+              },
+              {
+                "name": "document_material_type_id",
+                "value": "={{ $json.document_material_type_id }}"
+              },
+              {
+                "name": "document_material_type_name_ar",
+                "value": "={{ $json.document_material_type_name_ar }}"
+              },
+              {
+                "name": "document_material_type_name_en",
+                "value": "={{ $json.document_material_type_name_en }}"
+              },
+              {
+                "name": "document_subject_id",
+                "value": "={{ $json.document_subject_id }}"
+              },
+              {
+                "name": "document_subject_name_ar",
+                "value": "={{ $json.document_subject_name_ar }}"
+              },
+              {
+                "name": "document_subject_name_en",
+                "value": "={{ $json.document_subject_name_en }}"
+              },
+              {
+                "name": "record_id",
+                "value": "={{ $json.record_id }}"
+              },
+              {
+                "name": "record_name_ar",
+                "value": "={{ $json.record_name_ar }}"
+              },
+              {
+                "name": "record_name_en",
+                "value": "={{ $json.record_name_en }}"
+              },
+              {
+                "name": "reference_no",
+                "value": "={{ $json.reference_no }}"
+              },
+              {
+                "name": "treatment_date",
+                "value": "={{ $json.treatment_date }}"
+              },
+              {
+                "name": "record_security_level_id",
+                "value": "={{ $json.record_security_level_id }}"
+              },
+              {
+                "name": "record_security_level_name_ar",
+                "value": "={{ $json.record_security_level_name_ar }}"
+              },
+              {
+                "name": "record_security_level_name_en",
+                "value": "={{ $json.record_security_level_name_en }}"
+              },
+              {
+                "name": "record_important_level_id",
+                "value": "={{ $json.record_important_level_id }}"
+              },
+              {
+                "name": "record_important_level_name_ar",
+                "value": "={{ $json.record_important_level_name_ar }}"
+              },
+              {
+                "name": "record_department_id",
+                "value": "={{ $json.record_department_id }}"
+              },
+              {
+                "name": "record_department_name_ar",
+                "value": "={{ $json.record_department_name_ar }}"
+              },
+              {
+                "name": "record_department_name_en",
+                "value": "={{ $json.record_department_name_en }}"
+              },
+              {
+                "name": "record_subject_id",
+                "value": "={{ $json.record_subject_id }}"
+              },
+              {
+                "name": "record_subject_name_ar",
+                "value": "={{ $json.record_subject_name_ar }}"
+              },
+              {
+                "name": "record_subject_name_en",
+                "value": "={{ $json.record_subject_name_en }}"
+              }
+            ]
+          }
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [
+        128,
+        -320
+      ],
+      "id": "21030a6f-9ff5-451a-a083-dd3f32e51eab",
+      "name": "Default Data Loader"
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "qdrantCollection": {
+          "__rl": true,
+          "value": "={{ $('index configs').item.json.COLLECTION_NAME }}",
+          "mode": "id"
+        },
+        "embeddingBatchSize": 50,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+      "typeVersion": 1.3,
+      "position": [
+        128,
+        -464
+      ],
+      "id": "3c60f6c7-8488-4900-bf62-21be50bb4c10",
+      "name": "Qdrant Vector Store Indexing",
+      "credentials": {
+        "qdrantApi": {
+          "id": "zxinMZsM5syzH7v6",
+          "name": "QdrantApi Local"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "indexed_rows",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        384,
+        -464
+      ],
+      "id": "9b882ffc-86c0-45ba-bfb5-c2b64505ea5d",
+      "name": "collect results"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"status\": \"success\",\n  \"response\": {\n    \"collection\": {{ JSON.stringify($('index configs').item.json.COLLECTION_NAME) }},\n    \"document_id_filter\": {{ JSON.stringify($('validate request').first().json.document_id_filter) }},\n    \"rows_indexed\": {{ ($json.indexed_rows || []).length }}\n  },\n  \"message\": \"OCR pages indexed successfully\",\n  \"code\": 200\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        656,
+        -464
+      ],
+      "id": "815f5b52-2598-4d9f-83b0-07b613e32804",
+      "name": "build index response"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "df54d284-2961-4dba-89b8-c8e2c468ea3d",
+              "name": "status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "e60c7d63-e203-409e-849b-cd5c9eb269ec",
+              "name": "response",
+              "value": "null",
+              "type": "string"
+            },
+            {
+              "id": "2bb185b5-2b6b-4361-8def-10cef83e8053",
+              "name": "message",
+              "value": "={{ 'BAD_REQUEST: The provided input is invalid, please check the payload and try again, details: ' + ( $json.error || $json.message || '' ) }}\n",
+              "type": "string"
+            },
+            {
+              "id": "b257a488-4dbd-48f1-9b7a-70955ad85d78",
+              "name": "code",
+              "value": 400,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -656,
+        -80
+      ],
+      "id": "36988433-e094-4176-af59-b9c403646cfb",
+      "name": "400- bad request",
+      "notesInFlow": true,
+      "notes": "validation failed"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5c5d324b-e2f4-46d3-a13d-df79ebb2f757",
+              "name": "status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "8d5d68a1-0c49-4ca6-8ac2-23cf40643fdf",
+              "name": "response",
+              "value": "null",
+              "type": "string"
+            },
+            {
+              "id": "12073452-c654-4d75-905c-043483d70a2e",
+              "name": "message",
+              "value": "={{ 'INTERNAL_ERROR: An internal error occurred while indexing OCR documents. ' + ( $json.error || $json.message || '' ) }}",
+              "type": "string"
+            },
+            {
+              "id": "a8a8469f-0ab2-4175-a9df-5930b4b840f9",
+              "name": "code",
+              "value": 500,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -128,
+        -80
+      ],
+      "id": "c1d790cc-3cf7-4c9b-8f64-ce8441164380",
+      "name": "500- internal err",
+      "notesInFlow": true,
+      "notes": "internal err"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        912,
+        -272
+      ],
+      "id": "3e9bde5a-ef58-4d75-88d4-52265551c242",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseCode": "={{ $json.code }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "server",
+                "value": "n8n"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1168,
+        -272
+      ],
+      "id": "7edb9192-8fb7-43fd-9905-910620e16094",
+      "name": "Respond to Webhook",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## Metadata full-text index (new)\n\nRuns in parallel with the OCR indexing pipeline every time\n'do index' fires. Ensures Qdrant has a text payload index on\nthe metadata fields used by the search workflow's metadata\nbranch (title, doc/reference no, keywords, record/subject\nname), so MatchText filters on those fields work.\n\nIdempotent -- Qdrant recreating an existing index with the\nsame schema is a harmless no-op.\n\nVERIFY before running:\n- QDRANT_BASE_URL / QDRANT_API_KEY in 'index configs'\n- that payload fields are actually nested under \"metadata.*\"\n  (matches this project's LangChain Qdrant node defaults --\n  confirm by inspecting one point's payload in Qdrant)\n- tokenizer choice (\"word\") for Arabic text -- Qdrant has no\n  built-in Arabic stemmer, tune min_token_len/tokenizer if\n  recall is poor",
+        "height": 400,
+        "width": 420,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1552,
+        128
+      ],
+      "id": "c0998db4-6500-4dbb-9f16-a144a0d07a33",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import json\n\ncfg = _items[0]['json']\nbase_url = (cfg.get('QDRANT_BASE_URL') or '').rstrip('/')\ncollection = cfg.get('COLLECTION_NAME')\nfields = json.loads(cfg.get('METADATA_TEXT_FIELDS') or '[]')\n\noutput = []\nfor field in fields:\n    output.append({\n        'json': {\n            'field_name': field,\n            'url': f\"{base_url}/collections/{collection}/index\",\n            'body': {\n                'field_name': field,\n                'field_schema': {\n                    'type': 'text',\n                    'tokenizer': 'word',\n                    'min_token_len': 2,\n                    'lowercase': True\n                }\n            }\n        }\n    })\nreturn output\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -912,
+        240
+      ],
+      "id": "3d0dff85-d735-4a9b-a532-a2faea5c8658",
+      "name": "prepare metadata index requests"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "api-key",
+              "value": "={{ $('index configs').item.json.QDRANT_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.body }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -656,
+        240
+      ],
+      "id": "c6e79fba-3e5b-425a-a904-443a26f93ba4",
+      "name": "create qdrant metadata index",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput",
+      "notes": "PUT /collections/{collection}/index -- creates (or re-creates) a text payload index for one metadata field per item"
+    }
+  ],
+  "connections": {
+    "do index": {
+      "main": [
+        [
+          {
+            "node": "index configs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "index configs": {
+      "main": [
+        [
+          {
+            "node": "validate request",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "prepare metadata index requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "validate request": {
+      "main": [
+        [
+          {
+            "node": "run OCR documents query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "400- bad request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "run OCR documents query": {
+      "main": [
+        [
+          {
+            "node": "prepare chunk metadata",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "500- internal err",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare chunk metadata": {
+      "main": [
+        [
+          {
+            "node": "Qdrant Vector Store Indexing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "500- internal err",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings (index)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Qdrant Vector Store Indexing",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Character Text Splitter": {
+      "ai_textSplitter": [
+        [
+          {
+            "node": "Default Data Loader",
+            "type": "ai_textSplitter",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Default Data Loader": {
+      "ai_document": [
+        [
+          {
+            "node": "Qdrant Vector Store Indexing",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant Vector Store Indexing": {
+      "main": [
+        [
+          {
+            "node": "collect results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "500- internal err",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collect results": {
+      "main": [
+        [
+          {
+            "node": "build index response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build index response": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "400- bad request": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "500- internal err": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare metadata index requests": {
+      "main": [
+        [
+          {
+            "node": "create qdrant metadata index",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "386245d8d199ae178499c372c5ced146eb720cfed8367d3a0cf9167ec180e200"
+  }
+}
